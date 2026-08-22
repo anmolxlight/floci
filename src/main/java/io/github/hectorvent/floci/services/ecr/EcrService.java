@@ -201,6 +201,25 @@ public class EcrService implements ResourceProvider {
         if (force) {
             deleteRepositoryStorage(account, region, repositoryName);
         }
+        if (force && !tags.isEmpty()) {
+            // Delete every manifest so blobs are unreferenced and tags stop
+            // resolving; registry garbage-collect reclaims the bytes later.
+            RegistryHttpClient http = registryManager.httpClient();
+            String internal = resolveRegistryRepoName(account, region, repositoryName);
+            int deleted = 0;
+            for (String tag : tags) {
+                try {
+                    String digest = http.headManifestDigest(internal, tag, null);
+                    if (digest != null && http.deleteManifest(internal, digest)) {
+                        deleted++;
+                    }
+                } catch (Exception e) {
+                    LOG.warnv("Force-delete of {0}:{1} failed: {2}", repositoryName, tag, e.getMessage());
+                }
+            }
+            LOG.infov("Force-deleting ECR repository {0}: removed {1}/{2} manifest(s)",
+                    repositoryName, deleted, tags.size());
+        }
 
         repoStore.delete(key);
         // Drop cached image metadata for this repo.
@@ -235,7 +254,7 @@ public class EcrService implements ResourceProvider {
     public List<ImageIdentifier> listImages(String repositoryName, String registryId, String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         registryManager.ensureStarted();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         try {
             RegistryHttpClient http = registryManager.httpClient();
             List<String> tags = http.listTags(internal);
@@ -257,7 +276,7 @@ public class EcrService implements ResourceProvider {
                                                 String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         registryManager.ensureStarted();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<String> refs = new ArrayList<>();
@@ -332,7 +351,7 @@ public class EcrService implements ResourceProvider {
                                               String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         registryManager.ensureStarted();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<Image> images = new ArrayList<>();
@@ -372,7 +391,7 @@ public class EcrService implements ResourceProvider {
                                                     String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         registryManager.ensureStarted();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<ImageIdentifier> deleted = new ArrayList<>();
@@ -536,7 +555,7 @@ public class EcrService implements ResourceProvider {
     private List<String> listTagsBestEffort(String account, String region, String repoName) {
         try {
             return registryManager.httpClient()
-                    .listTags(registryManager.internalRepoName(account, region, repoName));
+                    .listTags(resolveRegistryRepoName(account, region, repoName));
         } catch (Exception e) {
             LOG.debugv("Could not list tags for {0} (registry not available): {1}", repoName, e.getMessage());
             return List.of();
@@ -563,6 +582,30 @@ public class EcrService implements ResourceProvider {
                 repositoryName, cause.getMessage());
         return new AwsException("ServerException",
                 "Could not delete images from repository '" + repositoryName + "'", 500);
+    }
+
+    /**
+     * Resolves the repository name as stored in the backing registry.
+     * Hostname-style URIs ({@code <account>.dkr.ecr.<region>.localhost:<port>/<repo>})
+     * reach the raw registry, so docker pushes land under the bare repo name,
+     * while path-style URIs land under {@code <account>/<region>/<repo>}. Prefer
+     * the namespaced form; fall back to the bare name when nothing is stored
+     * there (issue #2444).
+     */
+    private String resolveRegistryRepoName(String account, String region, String repoName) {
+        String internal = registryManager.internalRepoName(account, region, repoName);
+        try {
+            RegistryHttpClient http = registryManager.httpClient();
+            if (!http.listTags(internal).isEmpty()) {
+                return internal;
+            }
+            if (!http.listTags(repoName).isEmpty()) {
+                return repoName;
+            }
+        } catch (Exception e) {
+            LOG.debugv("Registry lookup failed while resolving {0}: {1}", repoName, e.getMessage());
+        }
+        return internal;
     }
 
     private static String key(String region, String account, String repoName) {
