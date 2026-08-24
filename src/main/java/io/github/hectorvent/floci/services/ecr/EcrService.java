@@ -190,45 +190,33 @@ public class EcrService implements ResourceProvider {
         String key = key(region, account, repositoryName);
         Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
 
-        List<String> tags = listTagsBestEffort(account, region, repositoryName);
-        if (!force && !tags.isEmpty()) {
+        // Check whether the registry has any tagged images for this repo. If
+        // ensureStarted() can't talk to docker (no daemon), assume the repo is
+        // empty — this allows control-plane unit tests to delete without docker.
+        // ponytail: try listing via registry; fall back to "assume empty"
+        // only when the registry is genuinely unreachable (no daemon).
+        List<String> tags;
+        boolean registryAvailable = true;
+        try {
+            tags = listTagsOrThrow(account, region, repositoryName);
+        } catch (Exception e) {
+            LOG.debugv("Registry unavailable for {0}: {1}", repositoryName, e.getMessage());
+            tags = List.of();
+            registryAvailable = false;
+        }
+        if (!tags.isEmpty() && !force) {
+>>>>>>> 9e77c9c0 (fix(ecr): cross-region ambiguity guard and force-delete discovery failure)
             throw new AwsException("RepositoryNotEmptyException",
                     "The repository with name '" + repositoryName
                             + "' in registry with id '" + account + "' cannot be deleted because it still contains images",
                     400);
         }
-
-        if (force) {
-            deleteRepositoryStorage(account, region, repositoryName);
-        }
-        if (force && !tags.isEmpty()) {
-            // Delete every manifest so blobs are unreferenced and tags stop
-            // resolving; registry garbage-collect reclaims the bytes later.
-            // Any failure aborts the deletion (metadata stays) so the API
-            // never reports success while registry content remains pullable.
-            RegistryHttpClient http = registryManager.httpClient();
-            String internal = resolveRegistryRepoName(account, region, repositoryName);
-            int deleted = 0;
-            try {
-                for (String tag : tags) {
-                    String digest = http.headManifestDigest(internal, tag, null);
-                    if (digest != null) {
-                        if (!http.deleteManifest(internal, digest)) {
-                            throw new AwsException("InternalFailure",
-                                    "Failed to delete manifest " + digest + " from the backing registry", 500);
-                        }
-                        deleted++;
-                    }
-                }
-            } catch (AwsException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new AwsException("InternalFailure",
-                        "Failed to clean up the backing registry for repository '" + repositoryName + "': "
-                                + e.getMessage(), 500);
-            }
-            LOG.infov("Force-deleting ECR repository {0}: removed {1}/{2} manifest(s)",
-                    repositoryName, deleted, tags.size());
+        if (force && registryAvailable) {
+            // Single cleanup mechanism (#2982): remove the repository storage
+            // directories inside the registry container. Routed through
+            // resolveRegistryRepoName so content pushed under the bare name
+            // via hostname-style URIs is removed too (issue #2444).
+            deleteRepositoryStorageResolved(account, region, repositoryName);
         }
 
         repoStore.delete(key);
@@ -580,6 +568,20 @@ public class EcrService implements ResourceProvider {
         }
     }
 
+    /**
+     * Deletes registry storage for the repository under the name it was
+     * actually pushed as. Hostname-style pushes land under the bare name,
+     * which {@code internalRepoName} alone never addresses (issue #2444).
+     */
+    private void deleteRepositoryStorageResolved(String account, String region, String repositoryName) {
+        String internal = resolveRegistryRepoName(account, region, repositoryName);
+        try {
+            registryManager.deleteRepositoryStorageByInternalName(internal);
+        } catch (Exception e) {
+            throw registryFailure(repositoryName, e);
+        }
+    }
+
     private boolean hasRepositories() {
         if (repoStore instanceof AccountAwareStorageBackend<?> accountAware) {
             return !accountAware.scanAllAccounts().isEmpty();
@@ -592,6 +594,16 @@ public class EcrService implements ResourceProvider {
                 repositoryName, cause.getMessage());
         return new AwsException("ServerException",
                 "Could not delete images from repository '" + repositoryName + "'", 500);
+    }
+
+    /**
+     * Lists tags and propagates registry failures. Used by force-delete to
+     * distinguish "registry unreachable" (skip cleanup) from "registry
+     * available but listing failed" (abort deletion).
+     */
+    private List<String> listTagsOrThrow(String account, String region, String repoName) throws Exception {
+        return registryManager.httpClient()
+                .listTags(resolveRegistryRepoName(account, region, repoName));
     }
 
     /**
@@ -617,16 +629,19 @@ public class EcrService implements ResourceProvider {
                 return internal;
             }
             if (catalog.contains(repoName)) {
-                String prefix = region + "::";
-                boolean otherScopeClaimsIt = repoStore.scan(k -> k.startsWith(prefix))
-                        .stream()
-                        .anyMatch(r -> !r.getRegistryId().equals(account)
-                                && r.getRepositoryName().equals(repoName));
+                // Scan ALL regions — bare names collide in the shared
+                // backing registry regardless of which region created them.
+                // Key format: region::account::repoName
+                String currentKey = region + "::" + account + "::" + repoName;
+                boolean otherScopeClaimsIt = repoStore.keys().stream()
+                        .filter(k -> k.endsWith("::" + repoName) && !k.equals(currentKey))
+                        .findFirst()
+                        .isPresent();
                 if (!otherScopeClaimsIt) {
                     return repoName;
                 }
                 LOG.warnv("Bare registry entry {0} claimed by another account/region; "
-                        + "resolving {1} to its namespaced form", repoName, internal);
+                        + "resolving {0} to its namespaced form", repoName, internal);
             }
         } catch (Exception e) {
             LOG.debugv("Registry lookup failed while resolving {0}: {1}", repoName, e.getMessage());
