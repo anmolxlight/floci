@@ -55,6 +55,19 @@ public class RegistryHttpClient {
      * (registry:2 caps each page at 100 entries by default).
      */
     public List<String> catalog() throws IOException, InterruptedException {
+        try {
+            return catalogStrict();
+        } catch (IOException e) {
+            LOG.warnv("Registry catalog returned error: {0}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Strict catalog: throws on any non-200 so callers can distinguish
+     * &quot;no repos&quot; from &quot;registry failure&quot;.
+     */
+    public List<String> catalogStrict() throws IOException, InterruptedException {
         List<String> out = new ArrayList<>();
         String url = baseUrl + "/v2/_catalog";
         for (int page = 0; page < 10_000 && url != null; page++) {
@@ -65,8 +78,7 @@ public class RegistryHttpClient {
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
-                LOG.warnv("Registry catalog returned {0}: {1}", resp.statusCode(), resp.body());
-                break;
+                throw new IOException("Registry catalog returned " + resp.statusCode() + ": " + resp.body());
             }
             JsonNode root = MAPPER.readTree(resp.body());
             JsonNode repos = root.get("repositories");
@@ -139,6 +151,20 @@ public class RegistryHttpClient {
      */
     public String headManifestDigest(String name, String reference, List<String> acceptedMediaTypes)
             throws IOException, InterruptedException {
+        try {
+            return headManifestDigestStrict(name, reference, acceptedMediaTypes);
+        } catch (IOException e) {
+            LOG.warnv("Registry HEAD manifest {0}/{1} returned error: {2}", name, reference, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Strict HEAD: throws on registry error or missing digest so force-delete
+     * can abort instead of silently skipping a tag. 404 still returns null.
+     */
+    public String headManifestDigestStrict(String name, String reference, List<String> acceptedMediaTypes)
+            throws IOException, InterruptedException {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(baseUrl + "/v2/" + name + "/manifests/" + reference))
                 .timeout(Duration.ofSeconds(10))
                 .method("HEAD", HttpRequest.BodyPublishers.noBody());
@@ -148,10 +174,13 @@ public class RegistryHttpClient {
             return null;
         }
         if (resp.statusCode() >= 400) {
-            LOG.warnv("Registry HEAD manifest {0}/{1} returned {2}", name, reference, resp.statusCode());
-            return null;
+            throw new IOException("Registry HEAD manifest " + name + "/" + reference + " returned " + resp.statusCode());
         }
-        return resp.headers().firstValue("Docker-Content-Digest").orElse(null);
+        String digest = resp.headers().firstValue("Docker-Content-Digest").orElse(null);
+        if (digest == null || digest.isBlank()) {
+            throw new IOException("Registry HEAD manifest " + name + "/" + reference + " missing Docker-Content-Digest");
+        }
+        return digest;
     }
 
     /** Result of {@link #getManifest}: digest, body, and content media type. */

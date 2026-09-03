@@ -608,7 +608,7 @@ public class EcrService implements ResourceProvider {
      */
     private List<String> listTagsOrThrow(String account, String region, String repoName) throws Exception {
         return registryManager.httpClient()
-                .listTagsStrict(resolveRegistryRepoName(account, region, repoName));
+                .listTagsStrict(resolveRegistryRepoNameStrict(account, region, repoName));
     }
 
     /**
@@ -627,23 +627,28 @@ public class EcrService implements ResourceProvider {
      * falls back to the (empty) namespaced form.
      */
     private String resolveRegistryRepoName(String account, String region, String repoName) {
-        String internal = registryManager.internalRepoName(account, region, repoName);
         try {
-            List<String> catalog = registryManager.httpClient().catalog();
-            if (catalog.contains(internal)) {
-                return internal;
-            }
-            if (catalog.contains(repoName)) {
-                String currentKey = region + "::" + account + "::" + repoName;
-                boolean otherScopeClaimsIt = hasOtherScopeClaim(repoName, currentKey);
-                if (!otherScopeClaimsIt) {
-                    return repoName;
-                }
-                LOG.warnv("Bare registry entry {0} claimed by another account/region; "
-                        + "resolving {0} to its namespaced form", repoName, internal);
-            }
+            return resolveRegistryRepoNameStrict(account, region, repoName);
         } catch (Exception e) {
             LOG.debugv("Registry lookup failed while resolving {0}: {1}", repoName, e.getMessage());
+            return registryManager.internalRepoName(account, region, repoName);
+        }
+    }
+
+    private String resolveRegistryRepoNameStrict(String account, String region, String repoName) throws Exception {
+        String internal = registryManager.internalRepoName(account, region, repoName);
+        List<String> catalog = registryManager.httpClient().catalogStrict();
+        if (catalog.contains(internal)) {
+            return internal;
+        }
+        if (catalog.contains(repoName)) {
+            String currentKey = region + "::" + account + "::" + repoName;
+            boolean otherScopeClaimsIt = hasOtherScopeClaim(repoName, currentKey);
+            if (!otherScopeClaimsIt) {
+                return repoName;
+            }
+            LOG.warnv("Bare registry entry {0} claimed by another account/region; "
+                    + "resolving {0} to its namespaced form", repoName, internal);
         }
         return internal;
     }
