@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.ecr.model.AuthorizationData;
 import io.github.hectorvent.floci.services.ecr.model.ImageDetail;
 import io.github.hectorvent.floci.services.ecr.model.ImageFailure;
@@ -190,22 +191,26 @@ public class EcrService implements ResourceProvider {
         String key = key(region, account, repositoryName);
         Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
 
-        // Check whether the registry has any tagged images for this repo. If
-        // ensureStarted() can't talk to docker (no daemon), assume the repo is
-        // empty — this allows control-plane unit tests to delete without docker.
-        // ponytail: try listing via registry; fall back to "assume empty"
-        // only when the registry is genuinely unreachable (no daemon).
+        // Check whether the registry has any tagged images for this repo.
+        // Only when the registry is genuinely unreachable (no daemon) do we
+        // assume the repo is empty — this allows control-plane unit tests to
+        // delete without docker. Any other registry failure aborts the delete.
         List<String> tags;
         boolean registryAvailable = true;
         try {
             tags = listTagsOrThrow(account, region, repositoryName);
         } catch (Exception e) {
-            LOG.debugv("Registry unavailable for {0}: {1}", repositoryName, e.getMessage());
-            tags = List.of();
-            registryAvailable = false;
+            if (isRegistryUnreachable(e)) {
+                LOG.debugv("Registry unavailable for {0}: {1}", repositoryName, e.getMessage());
+                tags = List.of();
+                registryAvailable = false;
+            } else {
+                throw new AwsException("ServerException",
+                        "Failed to clean up the backing registry for repository '" + repositoryName + "': "
+                                + e.getMessage(), 500);
+            }
         }
         if (!tags.isEmpty() && !force) {
->>>>>>> 9e77c9c0 (fix(ecr): cross-region ambiguity guard and force-delete discovery failure)
             throw new AwsException("RepositoryNotEmptyException",
                     "The repository with name '" + repositoryName
                             + "' in registry with id '" + account + "' cannot be deleted because it still contains images",
@@ -629,14 +634,8 @@ public class EcrService implements ResourceProvider {
                 return internal;
             }
             if (catalog.contains(repoName)) {
-                // Scan ALL regions — bare names collide in the shared
-                // backing registry regardless of which region created them.
-                // Key format: region::account::repoName
                 String currentKey = region + "::" + account + "::" + repoName;
-                boolean otherScopeClaimsIt = repoStore.keys().stream()
-                        .filter(k -> k.endsWith("::" + repoName) && !k.equals(currentKey))
-                        .findFirst()
-                        .isPresent();
+                boolean otherScopeClaimsIt = hasOtherScopeClaim(repoName, currentKey);
                 if (!otherScopeClaimsIt) {
                     return repoName;
                 }
@@ -647,6 +646,36 @@ public class EcrService implements ResourceProvider {
             LOG.debugv("Registry lookup failed while resolving {0}: {1}", repoName, e.getMessage());
         }
         return internal;
+    }
+
+    private boolean hasOtherScopeClaim(String repoName, String currentKey) {
+        String suffix = "::" + repoName;
+        if (repoStore instanceof AccountAwareStorageBackend<?> aware) {
+            @SuppressWarnings("unchecked")
+            var typed = (AccountAwareStorageBackend<Repository>) aware;
+            return typed.scanAllAccountEntries(k -> k.endsWith(suffix) && !k.equals(currentKey))
+                    .stream().findAny().isPresent();
+        }
+        return repoStore.keys().stream()
+                .anyMatch(k -> k.endsWith(suffix) && !k.equals(currentKey));
+    }
+
+    private static boolean isRegistryUnreachable(Throwable e) {
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof java.net.ConnectException || t instanceof java.net.UnknownHostException
+                    || t instanceof NullPointerException) {
+                return true;
+            }
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("Connection refused") || msg.contains("Connection reset")
+                    || msg.contains("Failed to connect") || msg.contains("Connection timed out")
+                    || msg.contains("is null"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     private static String key(String region, String account, String repoName) {

@@ -475,7 +475,7 @@ class EcrServiceTest {
             service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
             AwsException ex = assertThrows(AwsException.class,
                     () -> service.deleteRepository(repositoryName, null, true, REGION));
-            assertEquals("InternalFailure", ex.getErrorCode());
+            assertEquals("ServerException", ex.getErrorCode());
 
             // Metadata survives so the operator can retry after fixing the registry.
             assertEquals(1, service.describeRepositories(List.of(repositoryName), null, REGION).size());
