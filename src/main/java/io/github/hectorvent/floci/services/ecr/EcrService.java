@@ -608,7 +608,7 @@ public class EcrService implements ResourceProvider {
      */
     private List<String> listTagsOrThrow(String account, String region, String repoName) throws Exception {
         return registryManager.httpClient()
-                .listTags(resolveRegistryRepoName(account, region, repoName));
+                .listTagsStrict(resolveRegistryRepoName(account, region, repoName));
     }
 
     /**

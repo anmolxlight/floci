@@ -94,6 +94,20 @@ public class RegistryHttpClient {
 
     /** Lists tags for a repository. Returns an empty list if the repo is not yet known to the registry. */
     public List<String> listTags(String name) throws IOException, InterruptedException {
+        try {
+            return listTagsStrict(name);
+        } catch (IOException e) {
+            LOG.warnv("Registry tags/list returned error: {0}", e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Lists tags, throwing on registry errors so callers can distinguish
+     * &quot;no tags&quot; from &quot;registry failure&quot;. 404 still returns
+     * empty; any other non-200 or malformed 200 throws {@link IOException}.
+     */
+    public List<String> listTagsStrict(String name) throws IOException, InterruptedException {
         HttpResponse<String> resp = http.send(
                 HttpRequest.newBuilder(URI.create(baseUrl + "/v2/" + name + "/tags/list"))
                         .timeout(Duration.ofSeconds(10))
@@ -104,13 +118,15 @@ public class RegistryHttpClient {
             return Collections.emptyList();
         }
         if (resp.statusCode() != 200) {
-            LOG.warnv("Registry tags/list returned {0}: {1}", resp.statusCode(), resp.body());
-            return Collections.emptyList();
+            throw new IOException("Registry tags/list returned " + resp.statusCode() + ": " + resp.body());
         }
         JsonNode root = MAPPER.readTree(resp.body());
         JsonNode tags = root.get("tags");
-        if (tags == null || tags.isNull() || !tags.isArray()) {
+        if (tags == null || tags.isNull()) {
             return Collections.emptyList();
+        }
+        if (!tags.isArray()) {
+            throw new IOException("Registry tags/list returned non-array tags: " + resp.body());
         }
         List<String> out = new ArrayList<>();
         tags.forEach(n -> out.add(n.asText()));
