@@ -522,6 +522,25 @@ class EcrServiceTest {
     }
 
     @Test
+    void deleteRepositoryForceAbortsOnNullPointerDuringDiscovery() throws Exception {
+        // An NPE (bug or null body element) must abort the delete, never
+        // masquerade as a registry outage (Greptile P1).
+        String repositoryName = "probe/npe-discovery";
+        RegistryHttpClient http = Mockito.mock(RegistryHttpClient.class);
+        when(registryManager.httpClient()).thenReturn(http);
+        when(http.listTagsStrict(anyString()))
+                .thenThrow(new NullPointerException("registry endpoint is null"));
+
+        service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.deleteRepository(repositoryName, null, true, REGION));
+        assertEquals("ServerException", ex.getErrorCode());
+
+        // Metadata survives so the operator can retry.
+        assertEquals(1, service.describeRepositories(List.of(repositoryName), null, REGION).size());
+    }
+
+    @Test
     void putImageTagMutability_roundTrips() {
         service.createRepository(REPO, null, null, null, null, null, null, REGION);
         Repository updated = service.putImageTagMutability(REPO, null, "IMMUTABLE", REGION);

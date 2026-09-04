@@ -191,12 +191,17 @@ public class EcrService implements ResourceProvider {
         Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
 
         // Check whether the registry has any tagged images for this repo.
-        // Only when the registry is genuinely unreachable (no daemon) do we
-        // assume the repo is empty — this allows control-plane unit tests to
-        // delete without docker. Any other registry failure aborts the delete.
+        // Only when the registry is genuinely unreachable (connection-level
+        // failure, or a test double with no HTTP client) do we assume the
+        // repo is empty. Any other registry failure aborts the delete.
         List<String> tags;
         boolean registryAvailable = true;
-        try {
+        if (registryManager.httpClient() == null) {
+            // Test double without an HTTP layer (Mockito default): no backing
+            // registry exists, so there is nothing to clean up.
+            tags = List.of();
+            registryAvailable = false;
+        } else try {
             tags = listTagsOrThrow(account, region, repositoryName);
         } catch (Exception e) {
             if (isRegistryUnreachable(e)) {
@@ -665,16 +670,18 @@ public class EcrService implements ResourceProvider {
     }
 
     private static boolean isRegistryUnreachable(Throwable e) {
+        // Only genuine connectivity failures qualify. An NPE or an "is null"
+        // message means a bug or an answered error body — those must abort
+        // the delete, never masquerade as an outage.
         Throwable t = e;
         while (t != null) {
             if (t instanceof java.net.ConnectException || t instanceof java.net.UnknownHostException
-                    || t instanceof NullPointerException) {
+                    || t instanceof java.net.SocketTimeoutException) {
                 return true;
             }
             String msg = t.getMessage();
             if (msg != null && (msg.contains("Connection refused") || msg.contains("Connection reset")
-                    || msg.contains("Failed to connect") || msg.contains("Connection timed out")
-                    || msg.contains("is null"))) {
+                    || msg.contains("Failed to connect") || msg.contains("Connection timed out"))) {
                 return true;
             }
             t = t.getCause();
