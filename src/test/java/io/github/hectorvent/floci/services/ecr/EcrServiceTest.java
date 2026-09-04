@@ -541,6 +541,27 @@ class EcrServiceTest {
     }
 
     @Test
+    void deleteRepositoryAbortsWhenRegistryUnreachable() throws Exception {
+        // A refused connection (registry down) must abort the delete, never
+        // assume the repo empty — otherwise non-force bypasses
+        // RepositoryNotEmptyException and force orphans pullable images
+        // behind deleted metadata (Greptile P1).
+        String repositoryName = "probe/unreachable-registry";
+        RegistryHttpClient http = Mockito.mock(RegistryHttpClient.class);
+        when(registryManager.httpClient()).thenReturn(http);
+        when(http.listTagsStrict(anyString()))
+                .thenThrow(new java.net.ConnectException("Connection refused"));
+
+        service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.deleteRepository(repositoryName, null, true, REGION));
+        assertEquals("ServerException", ex.getErrorCode());
+
+        // Metadata survives so the operator can retry after recovery.
+        assertEquals(1, service.describeRepositories(List.of(repositoryName), null, REGION).size());
+    }
+
+    @Test
     void putImageTagMutability_roundTrips() {
         service.createRepository(REPO, null, null, null, null, null, null, REGION);
         Repository updated = service.putImageTagMutability(REPO, null, "IMMUTABLE", REGION);

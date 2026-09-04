@@ -191,9 +191,11 @@ public class EcrService implements ResourceProvider {
         Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
 
         // Check whether the registry has any tagged images for this repo.
-        // Only when the registry is genuinely unreachable (connection-level
-        // failure, or a test double with no HTTP client) do we assume the
-        // repo is empty. Any other registry failure aborts the delete.
+        // A test double with no HTTP client means no backing registry exists,
+        // so there is nothing to clean up. Any failure against a real client
+        // aborts the delete: an unreachable registry cannot prove the repo
+        // empty (non-force must not bypass RepositoryNotEmptyException) and
+        // force must not orphan pullable images behind deleted metadata.
         List<String> tags;
         boolean registryAvailable = true;
         if (registryManager.httpClient() == null) {
@@ -205,14 +207,15 @@ public class EcrService implements ResourceProvider {
             tags = listTagsOrThrow(account, region, repositoryName);
         } catch (Exception e) {
             if (isRegistryUnreachable(e)) {
-                LOG.debugv("Registry unavailable for {0}: {1}", repositoryName, e.getMessage());
-                tags = List.of();
-                registryAvailable = false;
-            } else {
                 throw new AwsException("ServerException",
-                        "Failed to clean up the backing registry for repository '" + repositoryName + "': "
-                                + e.getMessage(), 500);
+                        "Backing registry unreachable for repository '" + repositoryName
+                                + "': retry after the registry recovers (" + e.getMessage() + ")",
+                        500);
             }
+            throw new AwsException("ServerException",
+                    "Failed to clean up the backing registry for repository '" + repositoryName + "': "
+                            + e.getMessage(),
+                    500);
         }
         if (!tags.isEmpty() && !force) {
             throw new AwsException("RepositoryNotEmptyException",
