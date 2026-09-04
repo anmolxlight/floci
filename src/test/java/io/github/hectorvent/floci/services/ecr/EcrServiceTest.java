@@ -29,6 +29,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -330,7 +331,10 @@ class EcrServiceTest {
     }
 
     @Test
-    void deleteRepositoryForceRemovesManifestsFromRegistry() throws Exception {
+    void deleteRepositoryForceDeletesResolvedStorageEntry() throws Exception {
+        // Hostname-style push landed under the bare name; force-delete must
+        // remove that entry (not the empty namespaced one) through the single
+        // #2982 storage mechanism, then drop the metadata row.
         String repositoryName = "probe/deleteme";
         String tag = "v1";
         String digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
@@ -344,17 +348,16 @@ class EcrServiceTest {
                 """;
 
         try (FakeRegistryServer registry = new FakeRegistryServer(repositoryName, tag, digest, manifest)) {
-            when(registryManager.getRepositoryUri(ACCOUNT, REGION, repositoryName))
-                    .thenReturn(ACCOUNT + ".dkr.ecr." + REGION + ".localhost:" + registry.port() + "/" + repositoryName);
             when(registryManager.httpClient())
                     .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
 
             service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
             service.deleteRepository(repositoryName, null, true, REGION);
 
-            assertTrue(registry.sawDelete(), "expected a DELETE /v2/<name>/manifests/<digest> call");
-            assertEquals(digest, registry.lastDeletedDigest(),
-                    "delete-repository --force must DELETE the manifest from the registry");
+            verify(registryManager).deleteRepositoryStorageByInternalName(repositoryName);
+            assertThrows(AwsException.class,
+                    () -> service.deleteRepository(repositoryName, null, true, REGION),
+                    "metadata row must be gone after force-delete");
         }
     }
 
@@ -461,16 +464,24 @@ class EcrServiceTest {
 
     @Test
     void deleteRepositoryForceFailsWhenRegistryCleanupFails() throws Exception {
-        // Registry rejects the manifest DELETE: force-delete must surface an
-        // error and keep the metadata row instead of reporting success
-        // (Greptile P1: suppressed cleanup failures).
+        // Storage deletion throws: force-delete must surface a 500 and keep
+        // the metadata row instead of reporting success (Greptile P1).
         String repositoryName = "probe/failing-delete";
         String tag = "v1";
         String digest = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
-        try (DeleteRejectingRegistryServer registry =
-                new DeleteRejectingRegistryServer(repositoryName, tag, digest)) {
+        String manifest = """
+                {
+                  "schemaVersion": 2,
+                  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                  "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1, "digest": "sha256:c"},
+                  "layers": []
+                }
+                """;
+        try (FakeRegistryServer registry = new FakeRegistryServer(repositoryName, tag, digest, manifest)) {
             when(registryManager.httpClient())
                     .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
+            doThrow(new RuntimeException("rm failed"))
+                    .when(registryManager).deleteRepositoryStorageByInternalName(anyString());
 
             service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
             AwsException ex = assertThrows(AwsException.class,
@@ -890,73 +901,4 @@ class EcrServiceTest {
         }
     }
 
-    /** Registry that accepts tag HEADs but rejects manifest DELETEs with 405. */
-    private static final class DeleteRejectingRegistryServer implements AutoCloseable {
-        private final HttpServer server;
-        private final String repository;
-        private final String tag;
-        private final String digest;
-
-        private DeleteRejectingRegistryServer(String repository, String tag, String digest) throws IOException {
-            this.repository = repository;
-            this.tag = tag;
-            this.digest = digest;
-            this.server = HttpServer.create(new InetSocketAddress(0), 0);
-            this.server.createContext("/v2/", this::handle);
-            this.server.start();
-        }
-
-        private int port() {
-            return server.getAddress().getPort();
-        }
-
-        private void handle(HttpExchange exchange) throws IOException {
-            String path = exchange.getRequestURI().getPath();
-            String method = exchange.getRequestMethod();
-            if ("/v2/".equals(path) && "GET".equals(method)) {
-                send(exchange, 200, "");
-                return;
-            }
-            if ("/v2/_catalog".equals(path) && "GET".equals(method)) {
-                sendJson(exchange, 200, "{\"repositories\":[\"" + repository + "\"]}");
-                return;
-            }
-            if (path.equals("/v2/" + repository + "/tags/list") && "GET".equals(method)) {
-                sendJson(exchange, 200, "{\"name\":\"" + repository + "\",\"tags\":[\"" + tag + "\"]}");
-                return;
-            }
-            if (path.equals("/v2/" + repository + "/manifests/" + tag) && "HEAD".equals(method)) {
-                exchange.getResponseHeaders().add("Docker-Content-Digest", digest);
-                exchange.sendResponseHeaders(200, -1);
-                exchange.close();
-                return;
-            }
-            if (path.equals("/v2/" + repository + "/manifests/" + digest) && "DELETE".equals(method)) {
-                // registry without DELETE enabled returns 405 METHOD_NOT_ALLOWED.
-                exchange.sendResponseHeaders(405, -1);
-                exchange.close();
-                return;
-            }
-            exchange.sendResponseHeaders(404, -1);
-            exchange.close();
-        }
-
-        private static void sendJson(HttpExchange exchange, int status, String body) throws IOException {
-            exchange.getResponseHeaders().add("Content-Type", "application/json");
-            send(exchange, status, body);
-        }
-
-        private static void send(HttpExchange exchange, int status, String body) throws IOException {
-            byte[] bytes = body.getBytes();
-            exchange.sendResponseHeaders(status, bytes.length);
-            try (OutputStream out = exchange.getResponseBody()) {
-                out.write(bytes);
-            }
-        }
-
-        @Override
-        public void close() {
-            server.stop(0);
-        }
-    }
 }
