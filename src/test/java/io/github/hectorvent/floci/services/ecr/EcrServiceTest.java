@@ -166,13 +166,28 @@ class EcrServiceTest {
     }
 
     @Test
-    void deleteRepository_forceRemovesRepositoryStorageAndPrunesFinalRepositoryStorage() {
-        service.createRepository(REPO, null, null, null, null, null, null, REGION);
+    void deleteRepository_forceRemovesRepositoryStorageAndPrunesFinalRepositoryStorage() throws Exception {
+        // The fake catalog carries the bare name (hostname-style push), so the
+        // storage delete must target it rather than the empty namespaced form.
+        String digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        String manifest = """
+                {
+                  "schemaVersion": 2,
+                  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                  "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1, "digest": "sha256:c"},
+                  "layers": []
+                }
+                """;
+        try (FakeRegistryServer registry = new FakeRegistryServer(REPO, "v1", digest, manifest)) {
+            when(registryManager.httpClient())
+                    .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
+            service.createRepository(REPO, null, null, null, null, null, null, REGION);
 
-        service.deleteRepository(REPO, null, true, REGION);
+            service.deleteRepository(REPO, null, true, REGION);
 
-        verify(registryManager).deleteRepositoryStorage(ACCOUNT, REGION, REPO);
-        verify(registryManager).pruneStorage();
+            verify(registryManager).deleteRepositoryStorageByInternalName(REPO);
+            verify(registryManager).pruneStorage();
+        }
     }
 
     @Test
@@ -186,17 +201,30 @@ class EcrServiceTest {
     }
 
     @Test
-    void deleteRepository_forceRetainsMetadataWhenRegistryCleanupFails() {
-        Mockito.doThrow(new IllegalStateException("registry unavailable"))
-                .when(registryManager).deleteRepositoryStorage(ACCOUNT, REGION, REPO);
-        service.createRepository(REPO, null, null, null, null, null, null, REGION);
+    void deleteRepository_forceRetainsMetadataWhenRegistryCleanupFails() throws Exception {
+        String manifest = """
+                {
+                  "schemaVersion": 2,
+                  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                  "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1, "digest": "sha256:c"},
+                  "layers": []
+                }
+                """;
+        try (FakeRegistryServer registry = new FakeRegistryServer(REPO, "v1",
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222", manifest)) {
+            when(registryManager.httpClient())
+                    .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
+            Mockito.doThrow(new IllegalStateException("registry unavailable"))
+                    .when(registryManager).deleteRepositoryStorageByInternalName(anyString());
+            service.createRepository(REPO, null, null, null, null, null, null, REGION);
 
-        AwsException ex = assertThrows(AwsException.class,
-                () -> service.deleteRepository(REPO, null, true, REGION));
+            AwsException ex = assertThrows(AwsException.class,
+                    () -> service.deleteRepository(REPO, null, true, REGION));
 
-        assertEquals("ServerException", ex.getErrorCode());
-        assertEquals(REPO, service.describeRepositories(List.of(REPO), null, REGION).getFirst().getRepositoryName());
-        verify(registryManager, never()).pruneStorage();
+            assertEquals("ServerException", ex.getErrorCode());
+            assertEquals(REPO, service.describeRepositories(List.of(REPO), null, REGION).getFirst().getRepositoryName());
+            verify(registryManager, never()).pruneStorage();
+        }
     }
 
     @Test
