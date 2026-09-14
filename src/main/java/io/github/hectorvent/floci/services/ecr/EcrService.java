@@ -731,7 +731,7 @@ public class EcrService implements ResourceProvider {
         String suffix = "::" + repoName;
         if (repoStore instanceof AccountAwareStorageBackend<?> aware) {
             @SuppressWarnings("unchecked")
-            var typed = (AccountAwareStorageBackend<Repository>) aware;
+            AccountAwareStorageBackend<Repository> typed = (AccountAwareStorageBackend<Repository>) aware;
             return typed.scanAllAccountEntries(k -> k.endsWith(suffix) && !k.equals(currentKey))
                     .stream().findAny().isPresent();
         }
@@ -741,7 +741,7 @@ public class EcrService implements ResourceProvider {
 
     private static boolean isRegistryUnreachable(Throwable e) {
         // Only genuine connectivity failures qualify. An NPE or an "is null"
-        // message means a bug or an answered error body — those must abort
+        // message means a bug or an answered error body, those must abort
         // the delete, never masquerade as an outage.
         Throwable t = e;
         while (t != null) {

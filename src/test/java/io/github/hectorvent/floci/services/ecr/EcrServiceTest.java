@@ -571,7 +571,7 @@ class EcrServiceTest {
 
         try (FakeRegistryServer registry =
                 new FakeRegistryServer(repositoryName, tag, digest, manifest)) {
-            // The fake serves the BARE name in its catalog and tags — simulating
+            // The fake serves the BARE name in its catalog and tags, simulating
             // a hostname-style push that bypassed the namespacing.
             when(registryManager.httpClient())
                     .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
@@ -579,7 +579,7 @@ class EcrServiceTest {
             // Account B created metadata for the same name.
             service.createRepository(repositoryName, "111111111111", null, null, null, null, null, REGION);
             // Account A creates its own repository; its namespaced entry does not
-            // exist in this registry, but a bare entry with that name DOES — the
+            // exist in this registry, but a bare entry with that name DOES, so the
             // ambiguity guard must keep resolution on A's namespaced form.
             service.createRepository(repositoryName, ACCOUNT, null, null, null, null, null, REGION);
 
@@ -642,7 +642,7 @@ class EcrServiceTest {
     @Test
     void deleteRepositoryAbortsWhenRegistryUnreachable() throws Exception {
         // A refused connection (registry down) must abort the delete, never
-        // assume the repo empty — otherwise non-force bypasses
+        // assume the repo empty: otherwise non-force bypasses
         // RepositoryNotEmptyException and force orphans pullable images
         // behind deleted metadata (Greptile P1).
         String repositoryName = "probe/unreachable-registry";
